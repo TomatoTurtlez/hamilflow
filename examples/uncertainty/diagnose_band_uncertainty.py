@@ -8,7 +8,9 @@ Hamiltonian and a freshly averaged one, and reports:
               identical, info.json occupation per member
   [avg]       max |stored avg - fresh mean of members| over matrix entries
               (detects a stale avg_ham/<structure>/hamiltonian.h5)
-  [shifts]    per-member midgap-at-Gamma shift: recomputed vs stored in the JSON
+  [shifts]    per-member shift applied to the eigenvalues: recomputed vs stored in the JSON;
+              with align_mode "matrix" also the rigid shift c_m of each member's Hamiltonian
+              relative to the average, and its residual
   [sigma]     weighted max of sigma with three references:
                 - stored average Hamiltonian (what the calculator reports)
                 - fresh average Hamiltonian
@@ -58,6 +60,9 @@ from hamilflow.uncertainty import (
     average_predicted_hamiltonians,
     read_deeph_hamiltonian,
 )
+from hamilflow.uncertainty.alignment import (
+    fit_rigid_shifts,
+)
 
 
 def parse_args():
@@ -75,7 +80,7 @@ def parse_args():
     p.add_argument("--e-cut", type=float, default=2.0)
     p.add_argument("--tau", type=float, default=0.1)
     p.add_argument("--species", default='{"Mo": 42, "S": 16}', help="JSON element -> atomic number map")
-    p.add_argument("--align-mode", choices=["grid", "gamma"], default=None,
+    p.add_argument("--align-mode", choices=["matrix", "grid", "gamma"], default=None,
                    help="default: as stored in the JSON ('gamma' for files written before align_mode existed)")
     p.add_argument("--ill-method", choices=["none", "orbital_removal"], default=None,
                    help="default: as stored in the JSON (none for older files)")
@@ -187,14 +192,26 @@ def diagnose(structure, model_dirs, args, calc, results):
     spectra += [raw_spectrum(model_dirs[0] / structure, avg_path), raw_spectrum(model_dirs[0] / structure, fresh_path)]
     if args.dft_root:
         spectra.append(raw_spectrum(Path(args.dft_root) / structure))
-    tmp.cleanup()
     spectra = calc.common_bands(*spectra)
     dft_raw = spectra.pop() if args.dft_root else None
     *member_raws, avg_raw, fresh_raw = spectra
 
-    members = [(raw, *calc.align_to_midgap(raw, ref_obj, a)) for raw in member_raws]
     avg_al, avg_shift = calc.align_to_midgap(avg_raw, ref_obj, a)
-    fresh_al, _ = calc.align_to_midgap(fresh_raw, ref_obj, a)
+    if calc.align_mode == "matrix":
+        # same as BandUncertaintyCalculator: subtract each member's rigid shift relative to the
+        # average, then one common reference (the average's midgap); counts below use the
+        # rigidly aligned raw spectra, so a constant offset of a member no longer shows up there
+        rigid = fit_rigid_shifts(model_paths, avg_path, model_dirs[0] / structure / calc.overlap_name)
+        print("[rigid] c_m vs average (eV): " + str([round(r["c_eV"], 4) for r in rigid])
+              + "   residual: " + str([round(r["residual"], 4) for r in rigid]))
+        rep["rigid_shifts"] = rigid
+        member_raws = [raw - r["c_eV"] for raw, r in zip(member_raws, rigid)]
+        # total shift applied to each member's original eigenvalues, as stored by the calculator
+        members = [(raw, raw + avg_shift, avg_shift - r["c_eV"]) for raw, r in zip(member_raws, rigid)]
+        fresh_al = fresh_raw + avg_shift
+    else:
+        members = [(raw, *calc.align_to_midgap(raw, ref_obj, a)) for raw in member_raws]
+        fresh_al, _ = calc.align_to_midgap(fresh_raw, ref_obj, a)
     raws = np.stack([m[0] for m in members])
     aligned = np.stack([m[1] for m in members])
     shifts = [float(m[2]) for m in members]
@@ -274,9 +291,15 @@ def diagnose(structure, model_dirs, args, calc, results):
     # ---------------------------------------------------------------- DFT
     if args.dft_root:
         dft_al, dft_shift = calc.align_to_midgap(dft_raw, ref_obj, a)
-        err = np.abs(avg_al - dft_al)
+        avg_vs = avg_al
+        if calc.align_mode == "matrix":
+            dft_dir = Path(args.dft_root) / structure
+            r = fit_rigid_shifts([avg_path], dft_dir / calc.hamiltonian_name, dft_dir / calc.overlap_name)[0]
+            print(f"[dft] rigid shift of the average vs DFT: c = {r['c_eV']:+.4f} eV, residual {r['residual']:.4f}")
+            avg_vs = avg_raw - r["c_eV"] + dft_shift
+        err = np.abs(avg_vs - dft_al)
         val, n_e, k_e = weighted_max(err, d, args.e_cut, args.tau)
-        o = offset_rms(avg_al, dft_al, window)
+        o = offset_rms(avg_vs, dft_al, window)
         print(f"[dft] weighted max |avg - DFT| = {val:.4f} eV at band {n_e}, k {k_e}; "
               f"shift avg {avg_shift:.4f} vs DFT {float(dft_shift):.4f}")
         print(f"[dft] RMS(avg[n+o] - DFT[n] - mean): " + "  ".join(f"{k:+d}:{v:.4f}" for k, v in o.items()))
@@ -284,6 +307,7 @@ def diagnose(structure, model_dirs, args, calc, results):
               f"  avg H {avg_counts.tolist()}")
         rep["dft"] = {"weighted_max_err": val, "band": n_e, "k": k_e, "offset_rms": {str(k): v for k, v in o.items()}}
 
+    tmp.cleanup()
     return rep
 
 
