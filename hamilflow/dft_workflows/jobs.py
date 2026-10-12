@@ -6,6 +6,7 @@ from pathlib import Path
 from shutil import move, rmtree
 from typing import Any, Sequence
 
+import numpy as np
 from ase.io import read as ase_read
 from atomate2.aims.jobs.core import StaticMaker
 from deepx_dock.convert.fhi_aims.aims_to_deeph import PeriodicAimsDataTranslator
@@ -35,6 +36,18 @@ def _gunzip_in_place(root: Path) -> None:
         if gz.exists() and not out.exists():
             with gzip.open(gz, "rb") as fi, open(out, "wb") as fo:
                 shutil.copyfileobj(fi, fo)
+
+
+def _compress_raw(d: Path) -> None:
+    """Free space after conversion: gzip raw rs_* matrices, drop the unzipped copies."""
+    for f in d.glob("rs_*"):
+        if f.is_file() and f.suffix != ".gz":
+            with open(f, "rb") as fi, gzip.open(f"{f}.gz", "wb") as fo:
+                shutil.copyfileobj(fi, fo)
+            f.unlink()
+    for n in ("control.in", "geometry.in", "aims.out"):
+        if (d / f"{n}.gz").exists():
+            (d / n).unlink(missing_ok=True)
 
 
 def build_aims_dft_jobs(
@@ -79,6 +92,15 @@ def build_aims_dft_jobs(
         ):
             raise ValueError(
                 "Provide either kgrid or k-point sampling settings, not both."
+            )
+        # Handle special case: if any fractional coordinate is near 0.5, translate slightly to avoid symmetry issues
+        if np.any(np.abs((structure.frac_coords % 1.0) - 0.5) < 1e-3):
+            structure = structure.copy()
+            structure.translate_sites(
+                list(range(len(structure))),
+                [0.0137] * 3,
+                frac_coords=True,
+                to_unit_cell=True,
             )
         kpoints_settings = get_ksampling(
             structure=structure,
@@ -234,6 +256,9 @@ def convert_aims_to_deeph_structure(
         export_r=export_r,
         minus_H0=minus_H0,
     )
+
+    if (output_dir / structure_name / "overlap.h5").exists():
+        _compress_raw(input_root / structure_name)
 
     return {
         "structure_name": structure_name,
