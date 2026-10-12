@@ -9,6 +9,7 @@ import time
 
 from hamilflow.sparse_hamiltonian import SparseHamiltonianObj
 
+from .alignment import fit_rigid_shifts, write_aligned_hamiltonian
 from .hamiltonian_io import average_predicted_hamiltonians
 
 import spglib
@@ -21,11 +22,22 @@ class BandUncertaintyCalculator:
       calc = BandUncertaintyCalculator()
       output = calc.compute(model_dirs, dft_dir)
 
-    - `align_mode`: reference energy every spectrum is shifted to zero before comparison.
-      "grid" (default): midgap between the VBM (max over the k-grid of the highest occupied
-      band) and the CBM (min over the k-grid of the lowest unoccupied band), i.e. the true
-      gap as resolved by `grid_mesh`. "gamma": midgap between HOMO and LUMO at `anchor_k`
-      (the behavior before `align_mode` existed).
+    - `align_mode`: how spectra are put on a common energy reference before comparison.
+      "matrix" (default): each member's Hamiltonian is aligned to the averaged Hamiltonian by the
+      rigid shift c S that best explains their difference (`alignment.fit_rigid_shifts`); since
+      H - c S has the eigenvalues of H shifted by exactly -c, this subtracts c from the member's
+      eigenvalues, with no extra diagonalization. All spectra are then shifted by one common
+      reference, the averaged Hamiltonian's midgap on the k-grid. In `compare_averaged_to_dft`
+      the average is aligned to DFT the same way and DFT's midgap is the common reference.
+      Unlike a per-spectrum midgap, this keeps errors of the band edges (e.g. a member whose CBM
+      is too low) and is not moved by a single spurious state at an edge.
+      "grid": each spectrum shifted by its own midgap between the VBM (max over the k-grid of the
+      highest occupied band) and the CBM (min over the k-grid of the lowest unoccupied band).
+      "gamma": each spectrum shifted by its own midgap between HOMO and LUMO at `anchor_k`.
+    - `aligned_hamiltonian_dir`: with `align_mode="matrix"`, if given, the aligned Hamiltonians
+      are also written there (`model_<k>/<structure>/` for the members in `compute`,
+      `average_to_dft/<structure>/` for the average in `compare_averaged_to_dft`), with the shift
+      stored as an attribute. Not needed for the uncertainty itself; off by default.
     - `ill_method`: None or "orbital_removal" -- handling of an ill-conditioned overlap,
       applied to every diagonalization (members, averaged Hamiltonian, DFT). Orbitals are removed
       (`deepx_dock`'s global orbital truncation) until the smallest eigenvalue of S(k) on the
@@ -42,15 +54,18 @@ class BandUncertaintyCalculator:
     symprec: float = 1e-5
     species_number: dict[str, int] = field(default_factory=lambda: {"Mo": 42, "S": 16})
     hamiltonian_name: str = "hamiltonian.h5"
-    align_mode: str = "grid"
+    overlap_name: str = "overlap.h5"
+    align_mode: str = "matrix"
+    aligned_hamiltonian_dir: Path | None = None
+    batch_entries: int = 4_000_000
     ill_method: str | None = None
     ill_threshold: float = 1e-3
 
     _ILL_FILL_VALUE = 1e4
 
     def __post_init__(self):
-        if self.align_mode not in ("grid", "gamma"):
-            raise ValueError(f"align_mode must be 'grid' or 'gamma', got {self.align_mode!r}")
+        if self.align_mode not in ("matrix", "grid", "gamma"):
+            raise ValueError(f"align_mode must be 'matrix', 'grid' or 'gamma', got {self.align_mode!r}")
         if self.ill_method == "none":
             self.ill_method = None
         if self.ill_method not in (None, "orbital_removal"):
@@ -124,8 +139,8 @@ class BandUncertaintyCalculator:
         return n_occ - 1, n_occ
 
     def band_edges(self, eigvals, h_obj, anchor_k_idx=None):
-        """`(VBM, CBM)` of `eigvals[band, k]`: over all k-points for `align_mode="grid"`, at
-        `anchor_k_idx` for `align_mode="gamma"`."""
+        """`(VBM, CBM)` of `eigvals[band, k]`: at `anchor_k_idx` for `align_mode="gamma"`, over
+        all k-points otherwise ("grid", and the common reference of "matrix")."""
         homo_idx, lumo_idx = self.homo_lumo_indices(h_obj)
         if self.align_mode == "gamma":
             return float(eigvals[homo_idx, anchor_k_idx]), float(eigvals[lumo_idx, anchor_k_idx])
@@ -169,6 +184,21 @@ class BandUncertaintyCalculator:
         avg_path = self._resolve_average_hamiltonian_path(structure_name, model_paths, average_hamiltonian_dir)
         return SparseHamiltonianObj(Path(model_dirs[0]) / structure_name, H_file_path=avg_path)
 
+    def _fit_and_save(self, h_paths, ref_path, overlap_dir, labels, structure_name, aligned_to):
+        """Rigid shifts of `h_paths` relative to `ref_path` (overlap from `overlap_dir`); with
+        `aligned_hamiltonian_dir` set, also write each aligned Hamiltonian under
+        `<aligned_hamiltonian_dir>/<label>/<structure>/`."""
+        s_path = Path(overlap_dir) / self.overlap_name
+        rigid = fit_rigid_shifts(h_paths, ref_path, s_path, self.batch_entries)
+        if self.aligned_hamiltonian_dir is not None:
+            for h_path, label, r in zip(h_paths, labels, rigid):
+                write_aligned_hamiltonian(
+                    h_path, s_path, r["c_eV"],
+                    Path(self.aligned_hamiltonian_dir) / label / structure_name / self.hamiltonian_name,
+                    aligned_to=aligned_to, batch_entries=self.batch_entries,
+                )
+        return rigid
+
     def _structure_uncertainty(
         self,
         structure_name: str,
@@ -199,8 +229,17 @@ class BandUncertaintyCalculator:
         *raws, avg_raw = self.common_bands(*raws, avg_raw)
 
         # occupation/spinful come from info.json, identical for all members and the average
-        aligned_eigvals, shifts = zip(*(self.align_to_midgap(raw, ref_obj, anchor_k_idx) for raw in raws))
         avg_ham_aligned, avg_ham_shift = self.align_to_midgap(avg_raw, ref_obj, anchor_k_idx)
+        rigid = None
+        if self.align_mode == "matrix":
+            member_paths = [Path(d) / structure_name / self.hamiltonian_name for d in model_dirs]
+            rigid = self._fit_and_save(member_paths, avg_obj.matrix_path, model_dirs[0] / structure_name,
+                                       [f"model_{k + 1}" for k in range(len(member_paths))], structure_name,
+                                       aligned_to="ensemble average")
+            shifts = [avg_ham_shift - r["c_eV"] for r in rigid]
+            aligned_eigvals = [raw + s for raw, s in zip(raws, shifts)]
+        else:
+            aligned_eigvals, shifts = zip(*(self.align_to_midgap(raw, ref_obj, anchor_k_idx) for raw in raws))
 
         aligned_stack = np.stack(aligned_eigvals, axis=0)
         sigma_eigvals = np.std(aligned_stack, axis=0, ddof=1)
@@ -229,6 +268,8 @@ class BandUncertaintyCalculator:
             "vbm_index": self.homo_lumo_indices(ref_obj)[0],
             "per_model_shift_eV": [float(s) for s in shifts],
             "avg_hamiltonian_shift_eV": float(avg_ham_shift),
+            **({"per_model_rigid_shift_eV": [r["c_eV"] for r in rigid],
+                "per_model_rigid_shift_residual": [r["residual"] for r in rigid]} if rigid else {}),
             "per_model_gap_eV": [self.gap(raw, ref_obj) for raw in raws],
             "avg_hamiltonian_gap_eV": self.gap(avg_raw, ref_obj),
             "kpoints": result_per_k,
@@ -447,8 +488,15 @@ class BandUncertaintyCalculator:
 
         avg_obj = self._avg_hamiltonian_obj(structure_name, model_dirs, average_hamiltonian_dir)
         avg_raw, dft_raw = self.common_bands(avg_obj.diag(ks, **diag_kwargs), dft_obj.diag(ks, **diag_kwargs))
-        avg_aligned, _ = self.align_to_midgap(avg_raw, dft_obj, anchor_k_idx)
-        dft_aligned, _ = self.align_to_midgap(dft_raw, dft_obj, anchor_k_idx)
+        dft_aligned, dft_shift = self.align_to_midgap(dft_raw, dft_obj, anchor_k_idx)
+        rigid = None
+        if self.align_mode == "matrix":
+            rigid = self._fit_and_save([avg_obj.matrix_path], dft_root / structure_name / self.hamiltonian_name,
+                                       dft_root / structure_name, ["average_to_dft"], structure_name,
+                                       aligned_to="DFT")[0]
+            avg_aligned = avg_raw - rigid["c_eV"] + dft_shift
+        else:
+            avg_aligned, _ = self.align_to_midgap(avg_raw, dft_obj, anchor_k_idx)
 
         abs_err = np.abs(avg_aligned - dft_aligned)
 
@@ -470,6 +518,8 @@ class BandUncertaintyCalculator:
         return structure_name, {
             **self.settings(),
             "overall_mae_eV": overall_mae,
+            **({"avg_vs_dft_rigid_shift_eV": rigid["c_eV"],
+                "avg_vs_dft_rigid_shift_residual": rigid["residual"]} if rigid else {}),
             "n_bands": int(avg_raw.shape[0]),
             "n_kept_orbitals": self.n_kept_orbitals(ill_handler),
             "gap_avg_ham_eV": self.gap(avg_raw, dft_obj),

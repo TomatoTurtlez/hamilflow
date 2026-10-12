@@ -5,10 +5,11 @@ import json
 import os
 import tempfile
 
-import h5py
 import numpy as np
 from dataclasses import dataclass
 
+from .alignment import SparseStream, fit_rigid_shifts, pair_distances, write_aligned_hamiltonian
+from .band_postprocess import BandUncertaintyPostProcessor
 from .hamiltonian_io import average_predicted_hamiltonians
 
 
@@ -16,19 +17,31 @@ from .hamiltonian_io import average_predicted_hamiltonians
 class MatrixUncertaintyCalculator:
     """Compute Hamiltonian matrix-element uncertainty across an ensemble of models.
 
-    For each structure: obtain the average Hamiltonian (read it from
-    ``average_hamiltonian_dir`` if a file is already there, otherwise compute
-    it on the fly with :func:`hamiltonian_io.average_predicted_hamiltonians`),
-    then stream each model's real-space sparse ``entries`` dataset against the
-    average's, one chunk at a time, computing the per-matrix-element absolute
-    difference and its std across models. The structure's uncertainty is the
-    mean of these per-element stds.
+    For each structure: obtain the average Hamiltonian (read it from ``average_hamiltonian_dir``
+    if a file is already there, otherwise compute it with
+    :func:`hamiltonian_io.average_predicted_hamiltonians`), align every member to it, and stream
+    the real-space sparse ``entries`` of the members and the average one batch of atom-pair
+    blocks at a time, so peak memory stays bounded regardless of structure size.
 
-    ``entries`` (the on-disk flat array of real-space sparse Hamiltonian
-    values, see ``hamiltonian_io``) is never loaded in full for any model or
-    the average -- only ``chunk_size`` elements at a time, for every model and
-    the average alike, keeping peak memory at ``O(n_models * chunk_size)``
-    regardless of structure size.
+    - ``align``: remove from each member the rigid shift ``c_m S`` that best explains its
+      difference from the average (see :mod:`alignment`). Predicted Hamiltonians carry an absolute
+      energy offset that differs from model to model; without alignment it dominates the
+      matrix-element differences. The shifts and their residuals are reported.
+    - ``statistic``: ``"rms"`` (default) -- per matrix element, the RMS deviation of the members
+      from the average, ``sigma_e = sqrt(mean_m |h_m - c_m s - h_avg|^2)`` (the same definition as
+      the band uncertainty); ``"std_abs"`` -- the earlier statistic, the std over members of
+      ``|h_m - h_avg|`` (with ``ddof``), kept for comparison.
+    - Structure scores: ``uncertainty_rms`` (RMS of ``sigma_e`` over all elements),
+      ``uncertainty_mean`` (mean of ``sigma_e``), ``uncertainty_max`` (max of ``sigma_e``).
+    - ``weighting``: optional distance weighting, ``None`` (default), ``"fermi"`` or ``"exp"``.
+      Each atom pair ``p`` (R, i, j) gets the RMS of ``sigma_e`` over its block, ``sigma_p``, and a
+      weight ``w_p`` from its distance ``r_p = |R + x_j - x_i|`` (0 on-site): ``"fermi"`` is the
+      soft window of the band post-processing, ``w = F((r - r_cut)/tau) / F(-r_cut/tau)`` (1
+      on-site, flat up to ``r_cut``, dropping over a few ``tau``); ``"exp"`` is
+      ``exp(-r / decay_length)``. Adds ``uncertainty_weighted_mean`` (``sum w_p sigma_p / sum w_p``)
+      and ``uncertainty_weighted_max`` (``max w_p sigma_p``). Distances in Angstrom, from POSCAR.
+    - ``aligned_hamiltonian_dir``: if given (and ``align``), the aligned member Hamiltonians are
+      also written there, ``model_<k>/<structure>/``. Off by default.
 
     Example usage:
       calc = MatrixUncertaintyCalculator()
@@ -36,8 +49,33 @@ class MatrixUncertaintyCalculator:
     """
 
     hamiltonian_name: str = "hamiltonian.h5"
+    overlap_name: str = "overlap.h5"
     chunk_size: int = 2_000_000
     ddof: int = 1
+    align: bool = True
+    statistic: str = "rms"
+    weighting: str | None = None
+    r_cut: float = 5.0
+    tau: float = 0.5
+    decay_length: float = 2.0
+    aligned_hamiltonian_dir: Path | None = None
+
+    def __post_init__(self):
+        if self.statistic not in ("rms", "std_abs"):
+            raise ValueError(f"statistic must be 'rms' or 'std_abs', got {self.statistic!r}")
+        if self.weighting == "none":
+            self.weighting = None
+        if self.weighting not in (None, "fermi", "exp"):
+            raise ValueError(f"weighting must be None, 'fermi' or 'exp', got {self.weighting!r}")
+
+    def settings(self) -> dict:
+        """Settings that change the results, stored with every structure's output."""
+        out = {"align": self.align, "statistic": self.statistic, "weighting": self.weighting}
+        if self.weighting == "fermi":
+            out.update(r_cut=self.r_cut, tau=self.tau)
+        elif self.weighting == "exp":
+            out.update(decay_length=self.decay_length)
+        return out
 
     def _discover_structures(
         self,
@@ -55,21 +93,6 @@ class MatrixUncertaintyCalculator:
             structures = [s for s in structures if s not in excluded]
         return structures
 
-    def _iter_chunk_ranges(self, n_entries: int):
-        for start in range(0, n_entries, self.chunk_size):
-            yield start, min(start + self.chunk_size, n_entries)
-
-    @staticmethod
-    def _read_structure_meta(h5_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
-        """Read only the small layout arrays (never ``entries``) needed to
-        find the chunking range and to check that a model's sparse layout
-        matches the average's."""
-        with h5py.File(h5_path, "r") as f:
-            atom_pairs = np.array(f["atom_pairs"][:], dtype=np.int64)
-            chunk_shapes = np.array(f["chunk_shapes"][:], dtype=np.int64)
-            n_entries = f["entries"].shape[0]
-        return atom_pairs, chunk_shapes, n_entries
-
     def _resolve_average_path(
         self,
         structure_name: str,
@@ -83,6 +106,64 @@ class MatrixUncertaintyCalculator:
             average_predicted_hamiltonians(model_paths, avg_path)
         return avg_path
 
+    def _pair_weights(self, structure_dir: Path, atom_pairs: np.ndarray) -> np.ndarray | None:
+        if self.weighting is None:
+            return None
+        r = pair_distances(structure_dir, atom_pairs)
+        if self.weighting == "fermi":
+            return BandUncertaintyPostProcessor.soft_window(r, self.r_cut, self.tau)
+        return np.exp(-r / self.decay_length)
+
+    def _shifts(self, h_paths, ref_path, s_path, labels, structure_name, aligned_to, n_threads=1):
+        """Rigid shifts of `h_paths` relative to `ref_path` (zero when not aligning), writing the
+        aligned files if requested."""
+        if not self.align:
+            return None
+        rigid = fit_rigid_shifts(h_paths, ref_path, s_path, self.chunk_size, n_threads)
+        if self.aligned_hamiltonian_dir is not None:
+            for h_path, label, r in zip(h_paths, labels, rigid):
+                write_aligned_hamiltonian(
+                    h_path, s_path, r["c_eV"],
+                    Path(self.aligned_hamiltonian_dir) / label / structure_name / self.hamiltonian_name,
+                    aligned_to=aligned_to, batch_entries=self.chunk_size,
+                )
+        return rigid
+
+    def _deviation_stats(self, stream: SparseStream, n_dev: int, ref_index: int, shifts: list[float],
+                         weights: np.ndarray | None) -> dict:
+        """Stream `stream`, whose paths are the `n_dev` Hamiltonians to compare followed by the
+        reference at `ref_index`, and reduce the per-element deviations `h_k - c_k s - h_ref`."""
+        sum_sq = sum_val = 0.0
+        max_val = 0.0
+        n_total = 0
+        pair_sq = np.zeros(len(stream.atom_pairs)) if weights is not None else None
+        for p0, p1, hs, s in stream:
+            ref = hs[ref_index]
+            devs = np.stack([hs[k] - shifts[k] * s - ref for k in range(n_dev)], axis=0)
+            if self.statistic == "rms":
+                sigma = np.sqrt(np.mean(np.abs(devs) ** 2, axis=0))
+            else:
+                sigma = np.std(np.abs(devs), axis=0, ddof=self.ddof if n_dev > 1 else 0)
+            sum_sq += float(np.sum(sigma ** 2))
+            sum_val += float(np.sum(sigma))
+            max_val = max(max_val, float(sigma.max(initial=0.0)))
+            n_total += sigma.size
+            if pair_sq is not None:
+                offsets = stream.bounds[p0:p1] - stream.bounds[p0]
+                pair_sq[p0:p1] = np.add.reduceat(sigma ** 2, offsets) if sigma.size else 0.0
+        out = {
+            "uncertainty_rms": float(np.sqrt(sum_sq / n_total)) if n_total else 0.0,
+            "uncertainty_mean": sum_val / n_total if n_total else 0.0,
+            "uncertainty_max": max_val,
+            "n_matrix_elements": n_total,
+        }
+        if pair_sq is not None:
+            sizes = np.diff(stream.bounds)
+            sigma_p = np.sqrt(pair_sq / np.maximum(sizes, 1))
+            out["uncertainty_weighted_mean"] = float(np.sum(weights * sigma_p) / np.sum(weights))
+            out["uncertainty_weighted_max"] = float(np.max(weights * sigma_p))
+        return out
+
     def _compute_structure(
         self,
         structure_name: str,
@@ -93,58 +174,21 @@ class MatrixUncertaintyCalculator:
     ) -> tuple[str, dict]:
         model_paths = [Path(d) / structure_name / self.hamiltonian_name for d in model_dirs]
         avg_path = self._resolve_average_path(structure_name, model_paths, average_hamiltonian_dir, tmp_root)
+        structure_dir = Path(model_dirs[0]) / structure_name
+        s_path = structure_dir / self.overlap_name
 
-        avg_atom_pairs, avg_chunk_shapes, n_entries = self._read_structure_meta(avg_path)
-        for p in model_paths:
-            atom_pairs, chunk_shapes, n_model_entries = self._read_structure_meta(p)
-            if (
-                n_model_entries != n_entries
-                or not np.array_equal(atom_pairs, avg_atom_pairs)
-                or not np.array_equal(chunk_shapes, avg_chunk_shapes)
-            ):
-                raise ValueError(
-                    f"{structure_name}: sparse layout of {p} does not match the average "
-                    f"Hamiltonian ({avg_path}) -- atom_pairs/chunk_shapes/entries length "
-                    "must be identical across models"
-                )
+        rigid = self._shifts(model_paths, avg_path, s_path, [f"model_{k + 1}" for k in range(len(model_paths))],
+                             structure_name, "ensemble average", n_jobs)
+        shifts = [r["c_eV"] for r in rigid] if rigid else [0.0] * len(model_paths)
 
-        sum_std = 0.0
-        n_total = 0
-        stds = []
-
-        avg_file = h5py.File(avg_path, "r")
-        model_files = [h5py.File(p, "r") for p in model_paths]
-        try:
-            avg_dset = avg_file["entries"]
-            model_dsets = [f["entries"] for f in model_files]
-
-            def read_chunk(dset, start, end):
-                return np.asarray(dset[start:end])
-
-            for start, end in self._iter_chunk_ranges(n_entries):
-                avg_chunk = read_chunk(avg_dset, start, end)
-                if n_jobs > 1 and len(model_dsets) > 1:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_jobs, len(model_dsets))) as tex:
-                        model_chunks = list(tex.map(lambda d: read_chunk(d, start, end), model_dsets))
-                else:
-                    model_chunks = [read_chunk(d, start, end) for d in model_dsets]
-
-                diffs = np.abs(np.stack(model_chunks, axis=0) - avg_chunk[None, :])
-                std_chunk = np.std(diffs, axis=0, ddof=self.ddof)
-                stds.extend(std_chunk)
-                sum_std += float(std_chunk.sum())
-                n_total += std_chunk.size
-        finally:
-            avg_file.close()
-            for f in model_files:
-                f.close()
-
-        uncertainty_mean = sum_std / n_total if n_total else 0.0
-        uncertainty_max = max(stds)
+        stream = SparseStream(model_paths + [avg_path], s_path, self.chunk_size, n_jobs)
+        weights = self._pair_weights(structure_dir, stream.atom_pairs)
+        stats = self._deviation_stats(stream, len(model_paths), len(model_paths), shifts, weights)
         return structure_name, {
-            "uncertainty_mean": uncertainty_mean,
-            "uncertainty_max" : uncertainty_max,
-            "n_matrix_elements": n_total,
+            **self.settings(),
+            **stats,
+            **({"per_model_rigid_shift_eV": shifts,
+                "per_model_rigid_shift_residual": [r["residual"] for r in rigid]} if rigid else {}),
             "n_models": len(model_paths),
         }
 
@@ -184,11 +228,12 @@ class MatrixUncertaintyCalculator:
         """Compare each structure's averaged Hamiltonian (from ``model_dirs``, resolved the
         same way as `compute`) to the DFT reference Hamiltonian under `dft_root`.
 
-        Like `_compute_structure`, entries are streamed in `chunk_size` chunks rather than
-        loaded in full, so peak memory stays O(chunk_size) regardless of structure size.
-
-        Returns a dict keyed by structure with summary statistics (mean/max absolute
-        difference across matrix elements) similar in spirit to `compute`.
+        With ``align``, the average is first aligned to DFT by the rigid shift ``c S`` that best
+        explains their difference (reported as ``avg_vs_dft_rigid_shift_eV`` with its residual),
+        and written to ``aligned_hamiltonian_dir/average_to_dft/<structure>/`` if that is set.
+        Reports the mean, max and RMS absolute difference over matrix elements, and with
+        ``weighting`` the distance-weighted mean and max of the per-pair RMS difference.
+        Entries are streamed, so peak memory stays bounded regardless of structure size.
         """
         model_dirs = [Path(p) for p in model_dirs]
         dft_root = Path(dft_root)
@@ -199,41 +244,32 @@ class MatrixUncertaintyCalculator:
             for structure_name in structures:
                 model_paths = [Path(d) / structure_name / self.hamiltonian_name for d in model_dirs]
                 avg_path = self._resolve_average_path(structure_name, model_paths, average_hamiltonian_dir, tmp)
-                dft_path = dft_root / structure_name / self.hamiltonian_name
+                dft_dir = dft_root / structure_name
+                dft_path = dft_dir / self.hamiltonian_name
+                s_path = dft_dir / self.overlap_name
 
-                avg_atom_pairs, avg_chunk_shapes, n_entries = self._read_structure_meta(avg_path)
-                dft_atom_pairs, dft_chunk_shapes, n_dft_entries = self._read_structure_meta(dft_path)
-                if (
-                    n_dft_entries != n_entries
-                    or not np.array_equal(dft_atom_pairs, avg_atom_pairs)
-                    or not np.array_equal(dft_chunk_shapes, avg_chunk_shapes)
-                ):
-                    raise ValueError(
-                        f"{structure_name}: sparse layout of {dft_path} does not match the "
-                        f"averaged Hamiltonian ({avg_path}) -- atom_pairs/chunk_shapes/entries "
-                        "length must be identical"
-                    )
+                rigid = self._shifts([avg_path], dft_path, s_path, ["average_to_dft"], structure_name, "DFT")
+                c = rigid[0]["c_eV"] if rigid else 0.0
 
-                sum_abs_diff = 0.0
-                max_abs_diff = 0.0
-                n_total = 0
-
-                with h5py.File(avg_path, "r") as avg_file, h5py.File(dft_path, "r") as dft_file:
-                    avg_dset = avg_file["entries"]
-                    dft_dset = dft_file["entries"]
-                    for start, end in self._iter_chunk_ranges(n_entries):
-                        avg_chunk = np.asarray(avg_dset[start:end])
-                        dft_chunk = np.asarray(dft_dset[start:end])
-                        abs_diff = np.abs(avg_chunk - dft_chunk)
-                        sum_abs_diff += float(abs_diff.sum())
-                        max_abs_diff = max(max_abs_diff, float(abs_diff.max()) if abs_diff.size else 0.0)
-                        n_total += abs_diff.size
-
-                mean_abs_diff = sum_abs_diff / n_total if n_total else 0.0
+                stream = SparseStream([avg_path, dft_path], s_path, self.chunk_size)
+                weights = self._pair_weights(dft_dir, stream.atom_pairs)
+                stats = self._deviation_stats(stream, 1, 1, [c], weights)
+                sum_abs = max_abs = 0.0
+                for _, _, (h_avg, h_dft), s in SparseStream([avg_path, dft_path], s_path, self.chunk_size):
+                    a = np.abs(h_avg - c * s - h_dft)
+                    sum_abs += float(a.sum())
+                    max_abs = max(max_abs, float(a.max(initial=0.0)))
+                n_total = stats["n_matrix_elements"]
 
                 results[structure_name] = {
-                    "mean_abs_diff": mean_abs_diff,
-                    "max_abs_diff": max_abs_diff,
+                    **self.settings(),
+                    "mean_abs_diff": sum_abs / n_total if n_total else 0.0,
+                    "max_abs_diff": max_abs,
+                    "rms_diff": stats["uncertainty_rms"],
+                    **({"weighted_mean_rms_diff": stats["uncertainty_weighted_mean"],
+                        "weighted_max_rms_diff": stats["uncertainty_weighted_max"]} if weights is not None else {}),
+                    **({"avg_vs_dft_rigid_shift_eV": c,
+                        "avg_vs_dft_rigid_shift_residual": rigid[0]["residual"]} if rigid else {}),
                     "n_matrix_elements": n_total,
                 }
 
