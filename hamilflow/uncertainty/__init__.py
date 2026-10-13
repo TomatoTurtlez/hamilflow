@@ -6,6 +6,7 @@ Provides:
 - ``BandUncertaintyCalculator``
 - ``BandUncertaintyPostProcessor``, ``UncertaintyCalibrator``
 - ``MatrixUncertaintyCalculator``
+- ``fit_rigid_shifts``, ``write_aligned_hamiltonian`` (rigid-shift alignment, see ``alignment``)
 """
 
 from .hamiltonian_io import (
@@ -17,6 +18,7 @@ from .ensemble_io import discover_structures, link_ensemble_files
 from .band_uncertainty import BandUncertaintyCalculator
 from .band_postprocess import BandUncertaintyPostProcessor, UncertaintyCalibrator
 from .matrix_uncertainty import MatrixUncertaintyCalculator
+from .alignment import fit_rigid_shifts, write_aligned_hamiltonian
 
 __all__ = [
     "read_deeph_hamiltonian",
@@ -28,4 +30,6 @@ __all__ = [
     "BandUncertaintyPostProcessor",
     "UncertaintyCalibrator",
     "MatrixUncertaintyCalculator",
+    "fit_rigid_shifts",
+    "write_aligned_hamiltonian",
 ]
