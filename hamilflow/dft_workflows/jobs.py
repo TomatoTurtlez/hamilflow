@@ -257,7 +257,9 @@ def convert_aims_to_deeph_structure(
         minus_H0=minus_H0,
     )
 
-    if (output_dir / structure_name / "overlap.h5").exists():
+    if (output_dir / structure_name / "overlap.h5").exists() and (
+        output_dir / structure_name / "hamiltonian.h5"
+    ).exists():
         _compress_raw(input_root / structure_name)
 
     return {
